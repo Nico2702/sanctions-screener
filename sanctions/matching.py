@@ -1,13 +1,14 @@
 """
 Name matching utilities for the NaroIX Sanctions Screener.
 
-The main job: take a masterfile row with a primary name + 6 alternative names,
-and produce a compact, deduplicated set of query variants that maximizes
-the chance of hitting Dilisense's name-based matching.
+Philosophy: send clean base names (without legal suffixes, without share class
+markers) to Dilisense and let its built-in fuzzy matching handle the suffix
+variations. This produces fewer queries, fewer false positives, and faster
+responses than generating dozens of permutations manually.
 
-Key learning from the SenseTime test: OFAC lists entities with exact
-legal suffixes (e.g. "SenseTime Group Limited") that may differ from
-the name variants in the masterfile. So we permute legal suffixes.
+Key learning from the SenseTime test: OFAC lists "SenseTime Group Limited"
+but our masterfile has "SenseTime Group, Inc." — with fuzzy_search=2 Dilisense
+matches these correctly. We just need to make sure we send the clean base form.
 """
 
 from __future__ import annotations
@@ -16,21 +17,22 @@ import re
 from typing import Iterable
 
 
-# Share-class markers that should be stripped before generating suffix variants.
+# Share-class markers that should be stripped before querying.
 # Examples: "UBTECH ROBOTICS CORP LTD CLASS H", "SAMSUNG ELECTRONICS CO LTD GDR"
 SHARE_CLASS_PATTERNS = [
     r"\s+CLASS\s+[A-Z]\b",
     r"\s+CLASS\s+\d+\b",
-    r"\s+GDR\b",
-    r"\s+ADR\b",
     r"\s+SPONSORED\s+GDR\b",
     r"\s+SPONSORED\s+ADR\b",
+    r"\s+SPONSORED\b",       # trailing "Sponsored" alone
+    r"\s+GDR\b",
+    r"\s+ADR\b",
     r"\s+-\s+[A-Z]\s+SHARES?\b",
 ]
 
-# Legal suffixes to add/remove. Ordered roughly by global prevalence.
-# Note: 'Group' is deliberately NOT in this list because it's a meaningful
-# name component (e.g. "SenseTime Group"), not a legal suffix.
+# Legal suffixes used for (optional) base-name stripping.
+# We intentionally don't generate permutations from this list — Dilisense's
+# built-in fuzzy matching handles those variations.
 LEGAL_SUFFIXES = [
     "Limited", "Ltd", "Ltd.",
     "Corporation", "Corp.", "Corp",
@@ -39,18 +41,6 @@ LEGAL_SUFFIXES = [
     "AG", "SA", "SE", "NV", "PLC", "Plc",
 ]
 
-# A compact subset used when generating variants — we don't need every
-# possible form, just the ones most commonly seen in sanctions listings.
-# This keeps the Dilisense query count per entity low.
-LEGAL_SUFFIXES_CORE = [
-    "Limited", "Ltd",
-    "Corporation", "Corp.",
-    "Inc.",
-    "Co., Ltd.",
-    "Group Limited",
-]
-
-# Regex to detect and strip any of the above suffixes from the end of a name.
 _SUFFIX_STRIP_RE = re.compile(
     r"\s+(?:" + "|".join(re.escape(s) for s in sorted(LEGAL_SUFFIXES, key=len, reverse=True)) + r")\.?$",
     re.IGNORECASE,
@@ -62,78 +52,66 @@ def clean_share_class(name: str) -> str:
     out = name
     for pat in SHARE_CLASS_PATTERNS:
         out = re.sub(pat, "", out, flags=re.IGNORECASE)
-    return out.strip()
+    return out.strip().rstrip(",")
 
 
 def strip_legal_suffix(name: str) -> str:
     """
-    Remove trailing legal suffix (once). 'SenseTime Group Limited' -> 'SenseTime Group'.
-    Leaves 'SenseTime Group' unchanged.
+    Remove trailing legal suffix (once).
+    'SenseTime Group Limited' -> 'SenseTime Group'
     """
     return _SUFFIX_STRIP_RE.sub("", name).strip().rstrip(",")
 
 
 def get_base_name(name: str) -> str:
-    """
-    Normalize a masterfile name to its 'base' form:
-    remove share class markers AND trailing legal suffix.
-    """
-    cleaned = clean_share_class(name)
-    return strip_legal_suffix(cleaned)
-
-
-def generate_legal_variants(base: str) -> list[str]:
-    """
-    Given a base name (no suffix), generate the common legal-suffix permutations.
-    Uses LEGAL_SUFFIXES_CORE (a compact ~7-item set) to keep API cost low.
-    Dedup is caller's responsibility.
-    """
-    if not base:
-        return []
-    variants: list[str] = [base]  # base form itself (no suffix)
-    for suffix in LEGAL_SUFFIXES_CORE:
-        variants.append(f"{base} {suffix}")
-    return variants
+    """Remove share class markers AND trailing legal suffix."""
+    return strip_legal_suffix(clean_share_class(name))
 
 
 def build_query_names(
     primary_name: str,
-    alternatives: Iterable[str] = (),
+    alternatives: Iterable = (),
     *,
-    include_legal_variants: bool = True,
-    max_queries: int = 12,
-) -> list[str]:
+    include_base: bool = True,
+    max_queries: int = 10,
+) -> list:
     """
     Main entry point.
 
-    Produces a deduplicated list of name variants to send to Dilisense,
-    combining the primary name, alternative spellings, and (optionally)
-    legal-suffix permutations of each base name.
+    Produces a deduplicated list of name variants to send to Dilisense.
+    Strategy: send cleaned versions of primary name + alternatives, plus
+    the base form (without legal suffix) of the primary name.
+
+    Does NOT generate legal-suffix permutations — Dilisense's fuzzy_search=2
+    handles those natively.
 
     `max_queries` caps the output to keep API call cost predictable.
-    Dilisense counts each name in a batch as one query.
     """
-    candidates: list[str] = []
+    candidates = []
 
-    # Step 1: collect all raw names from the masterfile row
-    raw_names = [primary_name] + [a for a in alternatives if a and str(a).strip()]
-    raw_names = [str(n).strip() for n in raw_names if n and str(n).strip()]
+    # Primary name cleaned (share class removed)
+    primary_cleaned = clean_share_class(str(primary_name).strip())
+    if primary_cleaned:
+        candidates.append(primary_cleaned)
 
-    # Step 2: for each raw name, always include the cleaned form (no share class)
-    # and optionally its legal-suffix variants
-    base_forms: set[str] = set()
-    for raw in raw_names:
-        cleaned = clean_share_class(raw)
-        candidates.append(cleaned)
-        if include_legal_variants:
-            base = get_base_name(raw)
-            if base and base.lower() not in {b.lower() for b in base_forms}:
-                base_forms.add(base)
-                candidates.extend(generate_legal_variants(base))
+    # Base form of primary (share class + legal suffix removed)
+    if include_base:
+        primary_base = get_base_name(str(primary_name).strip())
+        if primary_base and primary_base.lower() != primary_cleaned.lower():
+            candidates.append(primary_base)
 
-    # Step 3: deduplicate (case-insensitive) while preserving order
-    seen: set[str] = set()
-    out: list[str] = []
+    # All non-empty alternatives, cleaned
+    for alt in alternatives:
+        if not alt or not str(alt).strip():
+            continue
+        alt_str = str(alt).strip()
+        alt_cleaned = clean_share_class(alt_str)
+        if alt_cleaned:
+            candidates.append(alt_cleaned)
+
+    # Deduplicate case-insensitively, preserve order
+    seen = set()
+    out = []
     for name in candidates:
         key = name.lower().strip()
         if key and key not in seen:
@@ -153,12 +131,8 @@ def build_query_names(
 # Tier 1 = EU / UN / OFAC SDN — formally binding for NaroIX as EU index provider
 # Tier 2 = OFAC Non-SDN (NS-CMIC, SSI etc.) + BIS + DoD CMC — US restrictions
 # Tier 3 = Other jurisdictions — info only
-#
-# These are the known Dilisense source_ids for the most critical lists.
-# The list is not exhaustive; any unknown source_id is categorized as "other"
-# and displayed in Tier 3 by default.
 
-SOURCE_TIER_MAP: dict[str, dict[str, str]] = {
+SOURCE_TIER_MAP = {
     # --- Tier 1: EU / UN / OFAC SDN ---
     "eu_financial_sanction_list": {
         "tier": "1",
@@ -215,11 +189,8 @@ SOURCE_TIER_MAP: dict[str, dict[str, str]] = {
 }
 
 
-def get_source_info(source_id: str) -> dict[str, str]:
-    """
-    Look up display metadata for a Dilisense source_id.
-    Unknown source_ids fall back to a Tier 3 'Other' entry.
-    """
+def get_source_info(source_id: str) -> dict:
+    """Look up display metadata for a Dilisense source_id."""
     info = SOURCE_TIER_MAP.get(source_id)
     if info:
         return info
@@ -236,8 +207,7 @@ def get_source_info(source_id: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-# Known program codes -> human-readable legal basis.
-PROGRAM_LEGAL_BASIS: dict[str, str] = {
+PROGRAM_LEGAL_BASIS = {
     "CMIC-EO13959": "Executive Order 13959, as amended by EO 14032 (CMIC)",
     "CMIC-EO14032": "Executive Order 14032 (CMIC)",
     "RUSSIA-EO14024": "Executive Order 14024 (Russia Harmful Foreign Activities)",
@@ -252,11 +222,9 @@ def lookup_legal_basis(program_code: str) -> str:
     """Map a program code like 'CMIC-EO13959' to a readable legal basis."""
     if not program_code:
         return ""
-    # Exact match first
     if program_code in PROGRAM_LEGAL_BASIS:
         return PROGRAM_LEGAL_BASIS[program_code]
-    # Prefix match (CMIC-EO13959-X -> CMIC-EO13959)
     for key, val in PROGRAM_LEGAL_BASIS.items():
         if program_code.startswith(key):
             return val
-    return program_code  # fall back to the raw code
+    return program_code
