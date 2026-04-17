@@ -2,8 +2,8 @@
 Dilisense API client for the NaroIX Sanctions Screener.
 
 Wraps the /checkEntity endpoint with clear error handling,
-a retry-on-timeout policy, and a compact response structure
-used throughout the app.
+a retry policy for transient failures (timeouts + 5xx errors),
+and a compact response structure used throughout the app.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
+
+import time
 
 import requests
 
@@ -22,8 +24,11 @@ DILISENSE_BASE_URL = "https://api.dilisense.com/v1"
 REQUEST_TIMEOUT_SECONDS = 90
 
 # Number of attempts for each call. A single retry handles transient
-# timeouts without user-visible failure.
+# timeouts and 5xx server errors without user-visible failure.
 MAX_ATTEMPTS = 2
+
+# Backoff between retries, in seconds.
+RETRY_BACKOFF_SECONDS = 1.5
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +76,7 @@ class ScreeningResult:
     hits: list = field(default_factory=list)
     error: str | None = None
     response_time_ms: float = 0.0
+    attempt_count: int = 1
 
     @property
     def is_flagged(self) -> bool:
@@ -111,9 +117,9 @@ class DilisenseClient:
     """
     Minimal client for the Dilisense AML Screening API.
 
-    Usage:
-        client = DilisenseClient(api_key="...")
-        result = client.check_entity("KYG8020E1199", "SMIC", ["SMIC", "Semiconductor..."])
+    Retries automatically on transient failures:
+      - ReadTimeout / ConnectionError
+      - 5xx server errors ("internal server error occurred")
     """
 
     def __init__(self, api_key: str, base_url: str = DILISENSE_BASE_URL) -> None:
@@ -126,42 +132,59 @@ class DilisenseClient:
 
     # -- low-level -----------------------------------------------------------
 
-    def _get(self, endpoint: str, params: dict | None = None) -> dict:
+    def _get(self, endpoint: str, params: dict | None = None) -> tuple[dict, int]:
+        """GET with retry. Returns (json_payload, attempt_count)."""
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
 
-        # Retry once on timeout / connection error. Dilisense can be
-        # slow on the first call or on batched queries against many lists.
-        resp = None
-        last_timeout_exc = None
-        for attempt in range(MAX_ATTEMPTS):
+        last_exc: Exception | None = None
+        last_resp: requests.Response | None = None
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
                 resp = self._session.get(
                     url, params=params or {}, timeout=REQUEST_TIMEOUT_SECONDS
                 )
-                break
+                last_resp = resp
             except requests.exceptions.ReadTimeout as exc:
-                last_timeout_exc = exc
-                if attempt < MAX_ATTEMPTS - 1:
+                last_exc = exc
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_BACKOFF_SECONDS)
                     continue
                 raise DilisenseError(
                     f"Dilisense did not respond within {REQUEST_TIMEOUT_SECONDS} seconds "
-                    f"after {MAX_ATTEMPTS} attempts. Try again in a moment, or reduce "
-                    f"the number of query variants."
+                    f"after {MAX_ATTEMPTS} attempts. Try again in a moment."
                 ) from exc
             except requests.exceptions.ConnectionError as exc:
-                raise DilisenseError(f"Connection error: {exc}") from exc
+                last_exc = exc
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_BACKOFF_SECONDS)
+                    continue
+                raise DilisenseError(f"Connection error after {MAX_ATTEMPTS} attempts: {exc}") from exc
 
-        if resp is None:
-            raise DilisenseError("No response received.") from last_timeout_exc
+            # Non-retryable client errors
+            if resp.status_code == 401:
+                raise DilisenseAuthError("401 Unauthorized — API key invalid or not activated.")
+            if resp.status_code == 429:
+                raise DilisenseQuotaError("429 Quota exceeded for this API key.")
 
-        if resp.status_code == 401:
-            raise DilisenseAuthError("401 Unauthorized — API key invalid or not activated.")
-        if resp.status_code == 429:
-            raise DilisenseQuotaError("429 Quota exceeded for this API key.")
-        if resp.status_code >= 500:
-            raise DilisenseError(f"{resp.status_code} Server error: {resp.text[:200]}")
-        resp.raise_for_status()
-        return resp.json()
+            # Retryable server errors (500, 502, 503, 504 ...)
+            if resp.status_code >= 500:
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(RETRY_BACKOFF_SECONDS)
+                    continue
+                raise DilisenseError(
+                    f"Dilisense server error ({resp.status_code}) after {MAX_ATTEMPTS} attempts. "
+                    f"Response: {resp.text[:200]}"
+                )
+
+            # 2xx / 3xx / 4xx (non-401, non-429) — let the caller handle it
+            resp.raise_for_status()
+            return resp.json(), attempt
+
+        # Fallback — should be unreachable
+        if last_resp is not None:
+            last_resp.raise_for_status()
+        raise DilisenseError("Request failed without a response.") from last_exc
 
     # -- high-level ----------------------------------------------------------
 
@@ -173,12 +196,7 @@ class DilisenseClient:
         *,
         fuzzy_search: int = 2,
     ) -> ScreeningResult:
-        """
-        Screen one entity against Dilisense.
-
-        `query_names` is typically the primary name + all alias variants generated
-        by matching.build_query_names().
-        """
+        """Screen one entity against Dilisense."""
         names = [n for n in query_names if n and n.strip()]
         if not names:
             return ScreeningResult(
@@ -189,17 +207,17 @@ class DilisenseClient:
         params = {"names": ",".join(names), "fuzzy_search": fuzzy_search}
 
         t0 = _now_ms()
+        attempts = 1
         try:
-            payload = self._get("checkEntity", params=params)
+            payload, attempts = self._get("checkEntity", params=params)
         except DilisenseError as exc:
             return ScreeningResult(
                 isin=isin, primary_name=primary_name, queried_names=names,
                 error=str(exc), response_time_ms=_now_ms() - t0,
+                attempt_count=attempts,
             )
 
         hits = _parse_hits(payload)
-        # Deduplicate by dilisense_id — batched queries can return duplicates
-        # if the same record matches multiple query names.
         seen, unique = set(), []
         for h in hits:
             if h.dilisense_id and h.dilisense_id not in seen:
@@ -212,11 +230,12 @@ class DilisenseClient:
             queried_names=names,
             hits=unique,
             response_time_ms=_now_ms() - t0,
+            attempt_count=attempts,
         )
 
     def get_source_list(self) -> list:
         """Return the list of sources covered by Dilisense (1 API call)."""
-        payload = self._get("getSourceList")
+        payload, _ = self._get("getSourceList")
         for key in ("sources", "source_list", "lists", "data"):
             if key in payload and isinstance(payload[key], list):
                 return payload[key]
@@ -258,5 +277,4 @@ def _parse_hits(payload: dict) -> list:
 
 
 def _now_ms() -> float:
-    import time
     return time.perf_counter() * 1000
