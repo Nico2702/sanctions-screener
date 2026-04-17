@@ -4,6 +4,10 @@ Dilisense API client for the NaroIX Sanctions Screener.
 Wraps the /checkEntity endpoint with clear error handling,
 a retry policy for transient failures (timeouts + 5xx errors),
 and a compact response structure used throughout the app.
+
+Default fuzzy_search level is 1 (matches the Colab test configuration that
+proved stable with 4-5 batched names). fuzzy_search=2 multiplies server load
+and can cause 500 errors when combined with multiple batched names.
 """
 
 from __future__ import annotations
@@ -23,12 +27,18 @@ DILISENSE_BASE_URL = "https://api.dilisense.com/v1"
 # and occasionally longer on batched queries against 130+ lists.
 REQUEST_TIMEOUT_SECONDS = 90
 
-# Number of attempts for each call. A single retry handles transient
+# Number of attempts per call. Single retry handles transient
 # timeouts and 5xx server errors without user-visible failure.
 MAX_ATTEMPTS = 2
 
 # Backoff between retries, in seconds.
 RETRY_BACKOFF_SECONDS = 1.5
+
+# Default fuzzy match level. 1 = tolerates ~1 character edit distance,
+# which is enough to match legal-suffix variations (e.g. "Group Limited"
+# vs "Group") when combined with the base-name matching strategy.
+# Level 2 multiplies server-side cost and triggered 500s in testing.
+DEFAULT_FUZZY_SEARCH = 1
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +129,7 @@ class DilisenseClient:
 
     Retries automatically on transient failures:
       - ReadTimeout / ConnectionError
-      - 5xx server errors ("internal server error occurred")
+      - 5xx server errors
     """
 
     def __init__(self, api_key: str, base_url: str = DILISENSE_BASE_URL) -> None:
@@ -194,7 +204,7 @@ class DilisenseClient:
         primary_name: str,
         query_names: Iterable,
         *,
-        fuzzy_search: int = 2,
+        fuzzy_search: int = DEFAULT_FUZZY_SEARCH,
     ) -> ScreeningResult:
         """Screen one entity against Dilisense."""
         names = [n for n in query_names if n and n.strip()]
