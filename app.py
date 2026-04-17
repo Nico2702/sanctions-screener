@@ -1,5 +1,19 @@
 """
-NaroIX Sanctions Screener — Streamlit app (Phase 1: Single Check)
+NaroIX Sanctions Screener — Streamlit app (Phase 1 + GitHub OAuth)
+
+Authentication:
+    - Uses GitHub OAuth via auth.py (same pattern as eod-financials)
+    - Whitelist of GitHub usernames in .streamlit/secrets.toml
+    - Call auth.require_login() at the top of main()
+
+Required secrets (see secrets.toml.template):
+    DILISENSE_API_KEY = "..."
+
+    [github_oauth]
+    client_id = "..."
+    client_secret = "..."
+    redirect_uri = "https://sanctions-screener.streamlit.app"
+    allowed_users = ["Nico2702", ...]
 """
 
 from __future__ import annotations
@@ -11,6 +25,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import auth
 from sanctions.dilisense_client import (
     DilisenseAuthError,
     DilisenseClient,
@@ -40,6 +55,11 @@ st.set_page_config(
 )
 
 
+# ---------------------------------------------------------------------------
+# Dilisense API key
+# ---------------------------------------------------------------------------
+
+
 def get_api_key():
     try:
         key = st.secrets.get("DILISENSE_API_KEY")
@@ -53,10 +73,16 @@ def get_api_key():
     return st.session_state.get("_manual_api_key")
 
 
+# ---------------------------------------------------------------------------
+# Sidebar (renders AFTER auth, so the user badge from auth.py appears first)
+# ---------------------------------------------------------------------------
+
+
 def render_sidebar():
     st.sidebar.title("🛡️ Sanctions Screener")
-    st.sidebar.caption("NaroIX — Phase 1 (Single Check)")
+    st.sidebar.caption("NaroIX — Phase 1")
 
+    # API key status
     st.sidebar.subheader("Dilisense API Key")
     existing_key = get_api_key()
     if existing_key:
@@ -71,6 +97,7 @@ def render_sidebar():
             st.rerun()
     api_key = get_api_key()
 
+    # Masterfile
     st.sidebar.subheader("Masterfile")
     uploaded = st.sidebar.file_uploader(
         "Upload masterfile (Excel)",
@@ -94,6 +121,11 @@ def render_sidebar():
         st.sidebar.warning("No masterfile available.")
 
     return api_key, df
+
+
+# ---------------------------------------------------------------------------
+# Result card rendering
+# ---------------------------------------------------------------------------
 
 
 def _tier_hits(result, tier):
@@ -192,6 +224,11 @@ def _render_hit_detail(hit, index, total):
     st.divider()
 
 
+# ---------------------------------------------------------------------------
+# Tab: Single Check
+# ---------------------------------------------------------------------------
+
+
 def tab_single_check(client, df):
     st.header("Single Check")
     st.caption("Screen a single entity against Dilisense.")
@@ -261,9 +298,19 @@ def tab_single_check(client, df):
     render_result_card(result)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main():
+    # Step 1: require GitHub OAuth login (blocks render if anonymous)
+    auth.require_login()
+
+    # Step 2: render sidebar and get API key + masterfile
     api_key, df = render_sidebar()
 
+    # Step 3: initialize Dilisense client
     client = None
     if api_key:
         try:
@@ -271,8 +318,14 @@ def main():
         except Exception as exc:
             st.sidebar.error(f"Client init failed: {exc}")
 
+    # Step 4: main content
+    user = auth.current_user()
     st.title("NaroIX Sanctions Screener")
-    st.caption(f"Phase 1 — Single Check   |   Dilisense API   |   {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    st.caption(
+        f"Phase 1 — Single Check   |   Dilisense API   |   "
+        f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}   |   "
+        f"Signed in as @{user.get('login', 'unknown')}"
+    )
 
     tab_single_check(client, df)
 
